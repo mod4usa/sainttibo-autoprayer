@@ -32,10 +32,12 @@ async function fixture({ clicks, failure = false, otherClicks = 0, timeoutSecond
   let counter = 1234;
   let received = 0;
   let completed = 0;
+  let maxInFlight = 0;
   let completedAtReload;
   await page.route('http://clicker.test/**', async route => {
     if (route.request().method() === 'POST') {
       received++;
+      maxInFlight = Math.max(maxInFlight, received - completed);
       if (hang) return;
       // Responses complete later than click dispatch, as on the live site.
       await new Promise(resolve => setTimeout(resolve, 50));
@@ -59,17 +61,19 @@ async function fixture({ clicks, failure = false, otherClicks = 0, timeoutSecond
   try {
     await page.goto('http://clicker.test/');
     const result = await runClicks(page, clicks, timeoutSeconds);
-    return { result, received, completedAtReload };
+    return { result, received, completedAtReload, maxInFlight };
   } finally {
     await page.close();
   }
 }
 
-test('dispatches the exact burst and waits for completion despite concurrent visitors', async () => {
-  const { result, received, completedAtReload } = await fixture({ clicks: 200, otherClicks: 17 });
+test('bounds pending requests and completes every click despite concurrent visitors', async () => {
+  const { result, received, completedAtReload, maxInFlight } = await fixture({ clicks: 200, otherClicks: 17 });
+  assert.ok(maxInFlight <= 16, `Queued ${maxInFlight} simultaneous requests`);
   assert.equal(received, 200);
   assert.equal(completedAtReload, 200);
   assert.equal(result.clickRequestsCompleted, 200);
+  assert.equal(result.clicksDispatched, 200);
   assert.equal(result.beforeCounter, 1234);
   assert.equal(result.afterCounter, 1451);
   assert.equal(result.counterIncrease, 217);
@@ -106,4 +110,15 @@ test('a configured timeout reports incomplete click requests', async () => {
   const { result } = await fixture({ clicks: 1, timeoutSeconds: 0.05, hang: true });
   assert.ok(result.errors.includes('Timed out after 0.05 seconds: 0/1 click requests completed.'));
   assert.equal(result.afterCounter, result.beforeCounter);
+  assert.equal(result.clickRequestsCompleted, 0);
+});
+
+test('a failed batch stops a 100,000-click run without queuing or retrying the rest', async () => {
+  const { result, received, maxInFlight } = await fixture({ clicks: 100_000, failure: true });
+  assert.equal(received, 16);
+  assert.equal(maxInFlight, 16);
+  assert.equal(result.clicksRequested, 100_000);
+  assert.equal(result.clicksDispatched, 16);
+  assert.equal(result.clickRequestsCompleted, 16);
+  assert.equal(result.errors.length, 16);
 });

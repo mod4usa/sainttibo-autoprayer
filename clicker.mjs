@@ -36,7 +36,7 @@ export async function launchBrowser() {
   });
 }
 
-export async function runClicks(page, clicks, timeoutSeconds = 0) {
+export async function runClicks(page, clicks, timeoutSeconds = 0, onProgress = () => {}) {
   await page.waitForFunction(selector => {
     const button = document.querySelector(selector);
     return button && !button.disabled;
@@ -47,15 +47,18 @@ export async function runClicks(page, clicks, timeoutSeconds = 0) {
   const requests = new Set();
   const errors = [];
   let completed = 0;
-  let finish;
-  const done = new Promise(resolve => { finish = resolve; });
+  let dispatched = 0;
+  let batchTarget = 0;
+  let finish = () => {};
+  let timedOut = false;
+  const progress = () => onProgress({ clicksRequested: clicks, dispatched, completed, errors: errors.length });
   const onRequest = request => {
     const url = new URL(request.url());
     if (request.method() === 'POST' && url.origin === new URL(page.url()).origin &&
         url.pathname.startsWith('/_serverFn/')) requests.add(request);
   };
   const onFinished = async request => {
-    if (!requests.has(request)) return;
+    if (!requests.delete(request)) return;
     try {
       const response = await request.response();
       if (!response?.ok()) errors.push(`Click request returned HTTP ${response?.status() ?? 'unknown'}.`);
@@ -63,48 +66,74 @@ export async function runClicks(page, clicks, timeoutSeconds = 0) {
       errors.push(error.message);
     }
     completed++;
-    if (completed === clicks) finish();
+    if (completed === batchTarget) finish();
   };
   const onFailed = request => {
-    if (!requests.has(request)) return;
+    if (!requests.delete(request)) return;
     errors.push(request.failure()?.errorText ?? 'Click request failed.');
     completed++;
-    if (completed === clicks) finish();
+    if (completed === batchTarget) finish();
   };
   page.on('request', onRequest);
   page.on('requestfinished', onFinished);
   page.on('requestfailed', onFailed);
   let timeout;
+  let progressInterval;
   try {
-    const timing = await page.evaluate(({ buttonSelector, counterSelector, clicks }) => {
-      const picture = document.querySelector(`${buttonSelector} img`);
+    const timing = await page.evaluate(counterSelector => {
       const raw = document.querySelector(counterSelector).textContent.trim();
       if (!/^[\d,]+$/.test(raw)) throw new Error(`Unexpected counter: ${raw}`);
       const beforeCounter = Number(raw.replaceAll(',', ''));
       const startTime = new Date().toISOString();
       const start = performance.now();
-      for (let i = 0; i < clicks; i++) picture.click();
       return {
         beforeCounter,
         startTime,
-        clicksEndTime: new Date().toISOString(),
-        clickElapsedMs: performance.now() - start,
+        clicksEndTime: startTime,
+        clickElapsedMs: 0,
         // timeOrigin + now remains comparable across the final navigation.
         startMonotonicMs: performance.timeOrigin + start,
       };
-    }, { buttonSelector: BUTTON, counterSelector: COUNTER, clicks });
+    }, COUNTER);
 
+    progress();
+    progressInterval = setInterval(progress, 5000);
     if (clicks > 0) {
       if (timeoutSeconds > 0) {
         timeout = setTimeout(() => {
+          timedOut = true;
           errors.push(`Timed out after ${timeoutSeconds} seconds: ${completed}/${clicks} click requests completed.`);
           finish();
         }, timeoutSeconds * 1000);
       }
-      await done;
+      while (dispatched < clicks && !timedOut && errors.length === 0) {
+        // Bound the browser queue and yield between batches so the page can
+        // process responses. Never retry a click whose server outcome is unknown.
+        const batchSize = Math.min(16, clicks - dispatched);
+        batchTarget = dispatched + batchSize;
+        const done = new Promise(resolve => { finish = resolve; });
+        Object.assign(timing, await page.evaluate(({ buttonSelector, batchSize, start }) => {
+          const button = document.querySelector(buttonSelector);
+          if (!button || button.disabled) throw new Error('Saint Tibo button is unavailable.');
+          const picture = button.querySelector('img');
+          for (let i = 0; i < batchSize; i++) picture.click();
+          return {
+            clicksEndTime: new Date().toISOString(),
+            clickElapsedMs: performance.timeOrigin + performance.now() - start,
+          };
+        }, { buttonSelector: BUTTON, batchSize, start: timing.startMonotonicMs }));
+        dispatched += batchSize;
+        await done;
+      }
       clearTimeout(timeout);
     }
-    // Reload only after requests settle, to read a fresh server-backed counter.
+    clearInterval(progressInterval);
+    progress();
+    // Freeze request tracking before reload, which may abort outstanding requests
+    // after a timeout. The report must not count those aborts as completed clicks.
+    page.off('request', onRequest);
+    page.off('requestfinished', onFinished);
+    page.off('requestfailed', onFailed);
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.locator(COUNTER).waitFor();
     const after = await page.evaluate(selector => {
@@ -118,6 +147,7 @@ export async function runClicks(page, clicks, timeoutSeconds = 0) {
     }, COUNTER);
     return {
       clicksRequested: clicks,
+      clicksDispatched: dispatched,
       clickRequestsCompleted: completed,
       beforeCounter: timing.beforeCounter,
       afterCounter: after.afterCounter,
@@ -132,6 +162,7 @@ export async function runClicks(page, clicks, timeoutSeconds = 0) {
     };
   } finally {
     clearTimeout(timeout);
+    clearInterval(progressInterval);
     page.off('request', onRequest);
     page.off('requestfinished', onFinished);
     page.off('requestfailed', onFailed);
@@ -149,7 +180,11 @@ async function main() {
   try {
     const page = await browser.newPage({ reducedMotion: 'reduce' });
     await page.goto(SITE, { waitUntil: 'domcontentloaded' });
-    const result = await runClicks(page, options.clicks, options.timeoutSeconds);
+    const result = await runClicks(page, options.clicks, options.timeoutSeconds, status => {
+      console.error(`Clicks: ${status.dispatched}/${status.clicksRequested} dispatched, ` +
+        `${status.completed} requests completed, ${status.dispatched - status.completed} pending, ` +
+        `${status.errors} errors`);
+    });
     console.log(JSON.stringify(result, null, 2));
     if (result.errors.length) process.exitCode = 1;
   } finally {

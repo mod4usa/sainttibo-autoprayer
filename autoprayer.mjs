@@ -70,6 +70,11 @@ export function nextConcurrency(current, maximum,
   };
 }
 
+export function retryAfterDelay(value = '', now = Date.now()) {
+  const delay = /^\d+$/.test(value.trim()) ? Number(value) * 1000 : Date.parse(value) - now;
+  return Number.isFinite(delay) ? Math.max(0, delay) : 0;
+}
+
 export async function launchBrowser() {
   return chromium.launch({
     headless: true,
@@ -89,9 +94,15 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
   const requests = new Map();
   const errors = [];
   let completed = 0;
+  let failed = 0;
   let dispatched = 0;
   let wake = () => {};
   let timedOut = false;
+  let recovering = false;
+  let recoveryCount = 0;
+  let pauseUntil = 0;
+  let recoveryDelayMs = 0;
+  let nextPauseMs = 2000;
   const initialConcurrency = concurrency;
   let peakConcurrency = concurrency;
   let samples = 0;
@@ -101,6 +112,9 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
   let rateStarted;
   let rateCompleted = 0;
   let recentRate = null;
+  const runStatus = () => timedOut ? 'timed_out'
+    : completed === prayers ? (failed ? 'completed_with_failures' : 'completed')
+      : recovering ? 'recovering' : 'running';
   const progress = () => {
     const now = performance.now();
     const averageRate = completed * 1000 / Math.max(1, now - runStarted);
@@ -113,12 +127,34 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
     }
     onProgress({
       prayersRequested: prayers, dispatched, completed, errors: errors.length,
+      succeeded: completed - failed, failed, status: runStatus(),
+      pauseRemainingSeconds: recovering ? Math.max(0, (pauseUntil - now) / 1000) : 0,
       concurrency, maxConcurrency,
       requestsPerSecond: recentRate ?? averageRate,
       averageRequestsPerSecond: averageRate,
       latencyMs: scaling.averageMs,
       scalingReason: scaling.reason,
     });
+  };
+  const recordFailure = (message, serverDelayMs = 0) => {
+    errors.push(message);
+    failed++;
+    scaling.reason = 'request failure';
+    if (dispatched >= prayers) return;
+    const firstInBurst = !recovering;
+    if (firstInBurst) {
+      recovering = true;
+      recoveryCount++;
+      concurrency = Math.max(1, Math.floor(concurrency / 2));
+      recoveryDelayMs = nextPauseMs;
+      nextPauseMs = Math.min(30_000, nextPauseMs * 2);
+      samples = 0;
+      latencySum = 0;
+    }
+    // Failures from the same outstanding pool extend one pause, without
+    // repeatedly halving concurrency or increasing the backoff for that burst.
+    pauseUntil = Math.max(pauseUntil, performance.now() + Math.max(recoveryDelayMs, serverDelayMs));
+    if (firstInBurst) progress();
   };
   const onRequest = request => {
     const url = new URL(request.url());
@@ -128,23 +164,29 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
   const onFinished = request => {
     const started = requests.get(request);
     if (!requests.delete(request)) return;
+    let failure;
+    let serverDelayMs = 0;
     try {
       const response = request.existingResponse();
-      if (!response?.ok()) errors.push(`Prayer request returned HTTP ${response?.status() ?? 'unknown'}.`);
+      if (!response?.ok()) {
+        failure = `Prayer request returned HTTP ${response?.status() ?? 'unknown'}.`;
+        serverDelayMs = retryAfterDelay(response?.headers()['retry-after']);
+      }
       else {
         samples++;
         latencySum += performance.now() - started;
       }
     } catch (error) {
-      errors.push(error.message);
+      failure = error.message;
     }
     completed++;
+    if (failure) recordFailure(failure, serverDelayMs);
     wake();
   };
   const onFailed = request => {
     if (!requests.delete(request)) return;
-    errors.push(request.failure()?.errorText ?? 'Prayer request failed.');
     completed++;
+    recordFailure(request.failure()?.errorText ?? 'Prayer request failed.');
     wake();
   };
   page.on('request', onRequest);
@@ -153,6 +195,7 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
   let timeout;
   let progressInterval;
   let scalingInterval;
+  let recoveryTimer;
   try {
     const timing = await page.evaluate(counterSelector => {
       const raw = document.querySelector(counterSelector).textContent.trim();
@@ -175,7 +218,7 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
     progress();
     progressInterval = setInterval(progress, 5000);
     scalingInterval = setInterval(() => {
-      if (errors.length || dispatched >= prayers) return;
+      if (recovering || dispatched >= prayers) return;
       const now = performance.now();
       let oldestPendingMs = 0;
       for (const started of requests.values()) oldestPendingMs = Math.max(oldestPendingMs, now - started);
@@ -186,6 +229,7 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
         baselineMs: scaling.baselineMs, cooldownWindows: scaling.cooldownWindows,
       });
       concurrency = scaling.concurrency;
+      if (scaling.reason === 'healthy responses' || scaling.reason === 'at maximum') nextPauseMs = 2000;
       samples = 0;
       latencySum = 0;
       peakConcurrency = Math.max(peakConcurrency, concurrency);
@@ -201,8 +245,24 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
         }, timeoutSeconds * 1000);
       }
       while (!timedOut && (dispatched < prayers || completed < dispatched)) {
+        if (recovering && completed === dispatched) {
+          const remainingPauseMs = pauseUntil - performance.now();
+          if (remainingPauseMs > 0) {
+            clearTimeout(recoveryTimer);
+            // Long Retry-After delays must not overflow Node's timer limit.
+            recoveryTimer = setTimeout(() => wake(), Math.min(remainingPauseMs, 2 ** 31 - 1));
+          } else {
+            recovering = false;
+            clearTimeout(recoveryTimer);
+            samples = 0;
+            latencySum = 0;
+            scaling.cooldownWindows = 2;
+            scaling.reason = 'resuming unsent prayers';
+            progress();
+          }
+        }
         const available = Math.min(concurrency - (dispatched - completed), prayers - dispatched);
-        if (errors.length === 0 && available > 0) {
+        if (!recovering && available > 0) {
           // Reserve slots before awaiting browser execution. Responses can arrive
           // during evaluate; each completion frees a slot independently.
           dispatched += available;
@@ -217,7 +277,6 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
             };
           }, { buttonSelector: BUTTON, count: available, start: timing.startMonotonicMs }));
         } else {
-          if (errors.length && completed === dispatched) break;
           // Scaling down drains existing requests; it never cancels or retries them.
           await new Promise(resolve => { wake = resolve; });
         }
@@ -226,6 +285,7 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
     }
     clearInterval(progressInterval);
     clearInterval(scalingInterval);
+    clearTimeout(recoveryTimer);
     progress();
     // Freeze request tracking before reload, which may abort outstanding requests
     // after a timeout. The report must not count those aborts as completed prayers.
@@ -247,6 +307,10 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
       prayersRequested: prayers,
       prayersDispatched: dispatched,
       prayerRequestsCompleted: completed,
+      prayerRequestsSucceeded: completed - failed,
+      prayerRequestsFailed: failed,
+      recoveryCount,
+      status: runStatus(),
       initialConcurrency,
       finalConcurrency: concurrency,
       peakConcurrency,
@@ -266,6 +330,7 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
     clearTimeout(timeout);
     clearInterval(progressInterval);
     clearInterval(scalingInterval);
+    clearTimeout(recoveryTimer);
     page.off('request', onRequest);
     page.off('requestfinished', onFinished);
     page.off('requestfailed', onFailed);
@@ -286,11 +351,14 @@ async function main() {
     await page.goto(SITE, { waitUntil: 'domcontentloaded' });
     const result = await runPrayers(page, options.prayers, options.timeoutSeconds, status => {
       console.error(`Prayers: ${status.dispatched}/${status.prayersRequested} dispatched, ` +
-        `${status.completed} requests completed, ${status.dispatched - status.completed} pending, ` +
+        `${status.completed} settled (${status.succeeded} succeeded, ${status.failed} failed), ${status.dispatched - status.completed} pending, ` +
         `${status.errors} errors, concurrency ${status.concurrency}/${status.maxConcurrency}, ` +
         `${status.requestsPerSecond.toFixed(1)} requests/s recent, ` +
         `${status.averageRequestsPerSecond.toFixed(1)} requests/s average, ` +
-        `${status.latencyMs === null ? 'n/a' : status.latencyMs.toFixed(0)} ms latency, ${status.scalingReason}`);
+        `${status.latencyMs === null ? 'n/a' : status.latencyMs.toFixed(0)} ms latency, ` +
+        `${status.status.replaceAll('_', ' ')}` +
+        (status.status === 'running' ? `, ${status.scalingReason}` : '') +
+        (status.status === 'recovering' ? `, pause ${status.pauseRemainingSeconds.toFixed(1)}s` : ''));
     }, options);
     console.log(JSON.stringify(result, null, 2));
     if (result.errors.length) process.exitCode = 1;

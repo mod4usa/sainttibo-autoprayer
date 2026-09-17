@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { launchBrowser, nextConcurrency, parseOptions, runPrayers } from './autoprayer.mjs';
+import { launchBrowser, nextConcurrency, parseOptions, retryAfterDelay, runPrayers } from './autoprayer.mjs';
 
 test('requires an explicit non-negative integer prayer count', () => {
   for (const args of [[], ['--prayers', '1.5'], ['--prayers=-1'], ['--prayers', 'NaN'],
@@ -93,12 +93,22 @@ test('learns a lasting latency shift without disabling congestion detection', ()
   assert.ok(stalled.concurrency < state.concurrency);
 });
 
+test('Retry-After accepts seconds and HTTP dates, and ignores invalid or expired delays', () => {
+  const now = Date.parse('2026-09-17T22:00:00Z');
+  assert.equal(retryAfterDelay('3', now), 3000);
+  assert.equal(retryAfterDelay('Thu, 17 Sep 2026 22:00:05 GMT', now), 5000);
+  assert.equal(retryAfterDelay('Thu, 17 Sep 2026 21:00:00 GMT', now), 0);
+  assert.equal(retryAfterDelay('invalid', now), 0);
+  assert.equal(retryAfterDelay(undefined, now), 0);
+});
+
 let browser;
 before(async () => { browser = await launchBrowser(); });
 after(async () => { await browser?.close(); });
 
 async function fixture({ prayers, failure = false, otherPrayers = 0, timeoutSeconds, hang = false,
-  concurrency = 16, maxConcurrency = 64, responseDelay = () => 50, networkFailure = false }) {
+  concurrency = 16, maxConcurrency = 64, responseDelay = () => 50, networkFailure = false,
+  failureStatus = 503, retryAfter }) {
   const page = await browser.newPage();
   let counter = 1234;
   let received = 0;
@@ -108,24 +118,31 @@ async function fixture({ prayers, failure = false, otherPrayers = 0, timeoutSeco
   let firstFinished = false;
   let thirdStartedBeforeFirstFinished = false;
   const progress = [];
+  const requestTimes = [];
   await page.route('http://autoprayer.test/**', async route => {
     if (route.request().method() === 'POST') {
       const number = ++received;
+      requestTimes.push(performance.now());
       if (number === 3) thirdStartedBeforeFirstFinished = !firstFinished;
       maxInFlight = Math.max(maxInFlight, received - completed);
       if (hang) return;
       // Responses complete later than prayer dispatch, as on the live site.
       await new Promise(resolve => setTimeout(resolve, responseDelay(number)));
-      if (networkFailure) {
+      if (typeof networkFailure === 'function' ? networkFailure(number) : networkFailure) {
         completed++;
         await route.abort('failed');
         return;
       }
-      if (!failure) counter++;
+      const rejected = typeof failure === 'function' ? failure(number) : failure;
+      if (!rejected) counter++;
       completed++;
       if (number === 1) firstFinished = true;
       if (completed === prayers) counter += otherPrayers;
-      await route.fulfill({ status: failure ? 503 : 200, body: String(counter) });
+      await route.fulfill({
+        status: rejected ? failureStatus : 200,
+        headers: rejected && retryAfter ? { 'Retry-After': retryAfter } : {},
+        body: String(counter),
+      });
       return;
     }
     if (received > 0) completedAtReload = completed;
@@ -141,9 +158,9 @@ async function fixture({ prayers, failure = false, otherPrayers = 0, timeoutSeco
   });
   try {
     await page.goto('http://autoprayer.test/');
-    const result = await runPrayers(page, prayers, timeoutSeconds, status => progress.push(status),
+    const result = await runPrayers(page, prayers, timeoutSeconds, status => progress.push({ ...status, at: performance.now() }),
       { concurrency, maxConcurrency });
-    return { result, received, completedAtReload, maxInFlight, thirdStartedBeforeFirstFinished, progress };
+    return { result, received, completedAtReload, maxInFlight, thirdStartedBeforeFirstFinished, progress, requestTimes };
   } finally {
     await page.close();
   }
@@ -195,14 +212,17 @@ test('a configured timeout reports incomplete prayer requests', async () => {
   assert.equal(result.prayerRequestsCompleted, 0);
 });
 
-test('a failure stops a 100,000-prayer run without queuing or retrying the rest', async () => {
-  const { result, received, maxInFlight } = await fixture({ prayers: 100_000, failure: true });
+test('the overall timeout interrupts recovery without queuing or retrying the rest', async () => {
+  const { result, received, maxInFlight } = await fixture({ prayers: 100_000, failure: true, timeoutSeconds: 0.25 });
   assert.equal(received, 16);
   assert.equal(maxInFlight, 16);
   assert.equal(result.prayersRequested, 100_000);
   assert.equal(result.prayersDispatched, 16);
   assert.equal(result.prayerRequestsCompleted, 16);
-  assert.equal(result.errors.length, 16);
+  assert.equal(result.prayerRequestsFailed, 16);
+  assert.equal(result.prayerRequestsSucceeded, 0);
+  assert.equal(result.errors.length, 17);
+  assert.equal(result.status, 'timed_out');
 });
 
 test('refills free slots while a slow request is still pending', async () => {
@@ -230,12 +250,58 @@ test('automatically grows the rolling pool while preserving its ceiling and tota
   assert.deepEqual(result.errors, []);
 });
 
-test('network failures stop further dispatch and drain the existing pool', async () => {
-  const { result, received } = await fixture({ prayers: 100, concurrency: 3, networkFailure: true });
-  assert.equal(received, 3);
-  assert.equal(result.prayerRequestsCompleted, 3);
+test('a burst of network failures pauses once, lowers concurrency, and continues only unsent prayers', async () => {
+  const { result, received, progress, requestTimes } = await fixture({
+    prayers: 20, concurrency: 8, networkFailure: number => number <= 3,
+  });
+  assert.equal(received, 20);
+  assert.equal(result.prayerRequestsCompleted, 20);
+  assert.equal(result.prayerRequestsSucceeded, 17);
+  assert.equal(result.prayerRequestsFailed, 3);
+  assert.equal(result.recoveryCount, 1);
+  assert.equal(result.status, 'completed_with_failures');
   assert.equal(result.errors.length, 3);
   assert.match(result.errors[0], /ERR_FAILED/);
+  const recovery = progress.find(status => status.status === 'recovering');
+  assert.equal(recovery.concurrency, 4);
+  assert.ok(requestTimes[recovery.dispatched] - recovery.at >= 1900);
+  assert.equal(progress.at(-1).status, 'completed_with_failures');
+});
+
+test('HTTP failures honor Retry-After before dispatching unsent prayers', async () => {
+  const { result, received, requestTimes } = await fixture({
+    prayers: 4, concurrency: 2, failure: number => number <= 2, failureStatus: 429, retryAfter: '3',
+  });
+  assert.equal(received, 4);
+  assert.equal(result.prayerRequestsSucceeded, 2);
+  assert.equal(result.prayerRequestsFailed, 2);
+  assert.equal(result.recoveryCount, 1);
+  assert.ok(requestTimes[2] - requestTimes[1] >= 2900);
+  assert.match(result.errors[0], /HTTP 429/);
+});
+
+test('repeated failures increase the pause while each requested prayer is attempted only once', async () => {
+  const { result, received, requestTimes } = await fixture({ prayers: 3, concurrency: 1, networkFailure: true });
+  assert.equal(received, 3);
+  assert.equal(result.prayerRequestsFailed, 3);
+  assert.equal(result.prayerRequestsSucceeded, 0);
+  assert.equal(result.recoveryCount, 2);
+  assert.ok(requestTimes[1] - requestTimes[0] >= 1900);
+  assert.ok(requestTimes[2] - requestTimes[1] >= 3900);
+  assert.equal(result.status, 'completed_with_failures');
+});
+
+test('historical errors do not prevent adaptive scaling after recovery', async () => {
+  const { result, progress } = await fixture({
+    prayers: 160, concurrency: 2, maxConcurrency: 3, networkFailure: number => number === 1,
+  });
+  const recoveryIndex = progress.findIndex(status => status.status === 'recovering');
+  assert.equal(progress[recoveryIndex].concurrency, 1);
+  assert.ok(progress.slice(recoveryIndex + 1).some(status => status.status === 'running' && status.concurrency > 1));
+  assert.equal(result.prayersDispatched, 160);
+  assert.equal(result.prayerRequestsSucceeded, 159);
+  assert.equal(result.prayerRequestsFailed, 1);
+  assert.equal(result.status, 'completed_with_failures');
 });
 
 test('stalled requests scale the target down without cancelling or dispatching replacements', async () => {

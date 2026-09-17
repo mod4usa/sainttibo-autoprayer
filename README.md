@@ -18,8 +18,17 @@ button to become enabled, and calls the picture's normal DOM `click()` handler
 the requested number of times. A rolling pool refills available request slots
 as responses arrive, so one slow request does not hold up every other prayer.
 The pool bounds outstanding requests to avoid filling the browser's queue.
-HTTP/network errors stop new prayers; existing requests are allowed to finish
-before the partial run is reported. Prayers are never retried.
+HTTP/network errors pause new prayers and halve the concurrency target, down
+to one. The script lets outstanding requests finish and then continues with
+unsent prayers after the pause. Failed prayers remain recorded and are never
+retried or replaced: `--prayers` specifies attempts, not guaranteed successes.
+
+The initial recovery pause is two seconds. Repeated failure episodes increase
+it to 4, 8, 16, then at most 30 seconds. Failures in the same outstanding pool
+share one reduction and pause, measured from the last failure. A healthy
+scaling window resets the backoff to two seconds. Longer server-provided
+`Retry-After` delays are honored. Recovery can continue throughout a run;
+`--timeout-seconds` still bounds the entire run when set.
 
 Concurrency automatically adjusts to observed response times:
 
@@ -51,6 +60,8 @@ Progress is printed to stderr every five seconds and whenever concurrency
 changes, showing dispatched, completed, pending, and failed request counts,
 the concurrency target and maximum, recent and lifetime-average completed
 requests per second, the latest window's mean latency, and the scaling decision.
+It distinguishes settled, successful, and failed requests, shows recovery pause
+time, and reports `completed with failures` when all attempts finish with errors.
 Recent throughput measures completions since the previous rate sample, at least
 one second apart; closely spaced log lines share the latest sample. The final
 JSON is printed to stdout.
@@ -79,8 +90,11 @@ Output is JSON containing:
 - `totalElapsedMs`: elapsed time from the start of praying through the final
   counter capture, including request completion and the reload.
 - `prayersRequested`, `prayersDispatched`, `prayerRequestsCompleted`,
-  `counterIncrease`, and `errors`. Completed requests include HTTP/network
-  failures; inspect `errors` to distinguish these from successful responses.
+  `counterIncrease`, and `errors`. Completed requests are settled requests,
+  including HTTP/network failures.
+- `prayerRequestsSucceeded`, `prayerRequestsFailed`, and `recoveryCount`:
+  successful HTTP responses, failed requests, and recovery episodes.
+- `status`: `completed`, `completed_with_failures`, or `timed_out`.
 - `initialConcurrency`, `finalConcurrency`, `peakConcurrency`, and
   `maxConcurrency`: the starting, final, highest, and maximum allowed request
   targets. After a reduction, pending requests can temporarily exceed the new

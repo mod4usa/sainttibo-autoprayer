@@ -1,10 +1,10 @@
 {
-  "name": "codexreset-clicker",
+  "name": "sainttibo-autoprayer",
   "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node clicker.mjs",
+    "start": "node autoprayer.mjs",
     "test": "node --test"
   },
   "engines": {

@@ -41,16 +41,33 @@ export function parseOptions(args) {
 
 // Called once per two-second observation window. Increase gradually; halve
 // the target on latency growth, including requests that have not finished yet.
-export function nextConcurrency(current, maximum, { samples, averageMs, baselineMs, oldestPendingMs }) {
+export function nextConcurrency(current, maximum,
+  { samples, averageMs, baselineMs, oldestPendingMs, cooldownWindows = 0 }) {
   const baseline = baselineMs ?? averageMs ?? 1000;
-  if ((samples > 0 && averageMs > Math.max(250, baseline * 2)) ||
-      oldestPendingMs > Math.max(1000, baseline * 3)) {
-    return Math.max(1, Math.floor(current / 2));
+  let concurrency = current;
+  let reason = samples ? 'learning baseline' : 'waiting for responses';
+  if (cooldownWindows > 0) {
+    reason = 'cooldown';
+  } else if (oldestPendingMs > Math.max(1000, baseline * 3)) {
+    concurrency = Math.max(1, Math.floor(current / 2));
+    reason = 'stalled request';
+  } else if (samples > 0 && averageMs > Math.max(250, baseline * 2)) {
+    concurrency = Math.max(1, Math.floor(current / 2));
+    reason = 'latency increase';
+  } else if (samples >= current && averageMs <= Math.max(100, baseline * 1.25)) {
+    concurrency = Math.min(maximum, current + 1);
+    reason = concurrency > current ? 'healthy responses' : 'at maximum';
   }
-  if (samples >= current && averageMs <= Math.max(100, baseline * 1.25)) {
-    return Math.min(maximum, current + 1);
-  }
-  return current;
+  return {
+    concurrency,
+    // Learn changed conditions in both directions, including while at the floor.
+    // A historical minimum would prevent recovery after a lasting latency shift.
+    baselineMs: samples ? (baselineMs == null ? averageMs : baselineMs * 0.8 + averageMs * 0.2) : baselineMs,
+    cooldownWindows: concurrency < current ? 2 : Math.max(0, cooldownWindows - 1),
+    averageMs,
+    oldestPendingMs,
+    reason,
+  };
 }
 
 export async function launchBrowser() {
@@ -79,13 +96,30 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
   let peakConcurrency = concurrency;
   let samples = 0;
   let latencySum = 0;
-  let baselineMs = null;
+  let scaling = { baselineMs: null, averageMs: null, cooldownWindows: 0, reason: 'initial' };
   let runStarted;
-  const progress = () => onProgress({
-    prayersRequested: prayers, dispatched, completed, errors: errors.length,
-    concurrency, maxConcurrency,
-    requestsPerSecond: completed * 1000 / Math.max(1, performance.now() - runStarted),
-  });
+  let rateStarted;
+  let rateCompleted = 0;
+  let recentRate = null;
+  const progress = () => {
+    const now = performance.now();
+    const averageRate = completed * 1000 / Math.max(1, now - runStarted);
+    // Nearby timer/scaling messages share a rate sample instead of reporting
+    // misleading zeroes or spikes over a few milliseconds.
+    if (now - rateStarted >= 1000) {
+      recentRate = (completed - rateCompleted) * 1000 / (now - rateStarted);
+      rateStarted = now;
+      rateCompleted = completed;
+    }
+    onProgress({
+      prayersRequested: prayers, dispatched, completed, errors: errors.length,
+      concurrency, maxConcurrency,
+      requestsPerSecond: recentRate ?? averageRate,
+      averageRequestsPerSecond: averageRate,
+      latencyMs: scaling.averageMs,
+      scalingReason: scaling.reason,
+    });
+  };
   const onRequest = request => {
     const url = new URL(request.url());
     if (request.method() === 'POST' && url.origin === new URL(page.url()).origin &&
@@ -137,6 +171,7 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
     }, COUNTER);
 
     runStarted = performance.now();
+    rateStarted = runStarted;
     progress();
     progressInterval = setInterval(progress, 5000);
     scalingInterval = setInterval(() => {
@@ -146,8 +181,11 @@ export async function runPrayers(page, prayers, timeoutSeconds = 0, onProgress =
       for (const started of requests.values()) oldestPendingMs = Math.max(oldestPendingMs, now - started);
       const averageMs = samples ? latencySum / samples : null;
       const previous = concurrency;
-      concurrency = nextConcurrency(concurrency, maxConcurrency, { samples, averageMs, baselineMs, oldestPendingMs });
-      if (samples) baselineMs = Math.min(baselineMs ?? averageMs, averageMs);
+      scaling = nextConcurrency(concurrency, maxConcurrency, {
+        samples, averageMs, oldestPendingMs,
+        baselineMs: scaling.baselineMs, cooldownWindows: scaling.cooldownWindows,
+      });
+      concurrency = scaling.concurrency;
       samples = 0;
       latencySum = 0;
       peakConcurrency = Math.max(peakConcurrency, concurrency);
@@ -250,7 +288,9 @@ async function main() {
       console.error(`Prayers: ${status.dispatched}/${status.prayersRequested} dispatched, ` +
         `${status.completed} requests completed, ${status.dispatched - status.completed} pending, ` +
         `${status.errors} errors, concurrency ${status.concurrency}/${status.maxConcurrency}, ` +
-        `${status.requestsPerSecond.toFixed(1)} requests/s`);
+        `${status.requestsPerSecond.toFixed(1)} requests/s recent, ` +
+        `${status.averageRequestsPerSecond.toFixed(1)} requests/s average, ` +
+        `${status.latencyMs === null ? 'n/a' : status.latencyMs.toFixed(0)} ms latency, ${status.scalingReason}`);
     }, options);
     console.log(JSON.stringify(result, null, 2));
     if (result.errors.length) process.exitCode = 1;

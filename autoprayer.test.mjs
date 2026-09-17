@@ -37,20 +37,60 @@ test('validates the initial concurrency and maximum', () => {
 
 test('healthy windows scale up gradually, respect the maximum, and require enough samples', () => {
   const healthy = { samples: 16, averageMs: 100, baselineMs: 100, oldestPendingMs: 100 };
-  assert.equal(nextConcurrency(16, 64, healthy), 17);
-  assert.equal(nextConcurrency(16, 16, healthy), 16);
-  assert.equal(nextConcurrency(16, 64, { ...healthy, samples: 1 }), 16);
-  assert.equal(nextConcurrency(16, 64, { ...healthy, baselineMs: null }), 17);
+  assert.equal(nextConcurrency(16, 64, healthy).concurrency, 17);
+  assert.equal(nextConcurrency(16, 16, healthy).concurrency, 16);
+  assert.equal(nextConcurrency(16, 64, { ...healthy, samples: 1 }).concurrency, 16);
+  assert.equal(nextConcurrency(16, 64, { ...healthy, baselineMs: null }).concurrency, 17);
 });
 
-test('latency growth and stalled requests scale down, with a floor of one and recovery', () => {
+test('latency growth and stalled requests scale down, with a floor of one', () => {
   const slow = { samples: 16, averageMs: 500, baselineMs: 100, oldestPendingMs: 500 };
-  assert.equal(nextConcurrency(16, 64, slow), 8);
-  assert.equal(nextConcurrency(3, 64, slow), 1);
-  assert.equal(nextConcurrency(1, 64, slow), 1);
-  assert.equal(nextConcurrency(16, 64, { ...slow, samples: 0, averageMs: null, oldestPendingMs: 4000 }), 8);
-  assert.equal(nextConcurrency(16, 64, { ...slow, samples: 0, averageMs: null, oldestPendingMs: 0 }), 16);
-  assert.equal(nextConcurrency(8, 64, { ...slow, averageMs: 100, oldestPendingMs: 100 }), 9);
+  assert.equal(nextConcurrency(16, 64, slow).concurrency, 8);
+  assert.equal(nextConcurrency(3, 64, slow).concurrency, 1);
+  assert.equal(nextConcurrency(1, 64, slow).concurrency, 1);
+  assert.equal(nextConcurrency(16, 64, { ...slow, samples: 0, averageMs: null, oldestPendingMs: 4000 }).concurrency, 8);
+  assert.equal(nextConcurrency(16, 64, { ...slow, samples: 0, averageMs: null, oldestPendingMs: 0 }).concurrency, 16);
+});
+
+test('recovers from concurrency one when successful responses remain slower than the original baseline', () => {
+  let state = { concurrency: 1, baselineMs: 50, cooldownWindows: 0 };
+  for (let window = 0; window < 10; window++) {
+    state = nextConcurrency(state.concurrency, 64, {
+      ...state, samples: 9, averageMs: 210, oldestPendingMs: 210,
+    });
+  }
+  assert.ok(state.concurrency > 1, 'Stable 210 ms responses must not be stuck behind a historical 50 ms minimum');
+  assert.ok(state.baselineMs > 150);
+});
+
+test('a reduction gives pending requests time to drain before another reduction', () => {
+  const slow = { samples: 16, averageMs: 500, baselineMs: 100, oldestPendingMs: 4000 };
+  let state = nextConcurrency(16, 64, slow);
+  assert.equal(state.concurrency, 8);
+  for (let window = 0; window < 2; window++) {
+    state = nextConcurrency(state.concurrency, 64, { ...state, samples: 0, averageMs: null, oldestPendingMs: 4000 });
+    assert.equal(state.concurrency, 8);
+  }
+  state = nextConcurrency(state.concurrency, 64, { ...state, samples: 0, averageMs: null, oldestPendingMs: 4000 });
+  assert.equal(state.concurrency, 4, 'Persistent stalls must still reduce the target after cooldown');
+});
+
+test('learns a lasting latency shift without disabling congestion detection', () => {
+  let state = { concurrency: 8, baselineMs: 50, cooldownWindows: 0 };
+  const targets = [];
+  for (let window = 0; window < 30; window++) {
+    state = nextConcurrency(state.concurrency, 16, {
+      ...state, samples: 20, averageMs: 500, oldestPendingMs: 500,
+    });
+    targets.push(state.concurrency);
+  }
+  assert.ok(Math.min(...targets) < 8);
+  assert.ok(state.concurrency > Math.min(...targets));
+  assert.ok(targets.every(target => target >= 1 && target <= 16));
+  const stalled = nextConcurrency(state.concurrency, 16, {
+    ...state, samples: 0, averageMs: null, oldestPendingMs: 5000,
+  });
+  assert.ok(stalled.concurrency < state.concurrency);
 });
 
 let browser;
@@ -208,4 +248,18 @@ test('stalled requests scale the target down without cancelling or dispatching r
   assert.equal(result.finalConcurrency, 2);
   assert.ok(progress.some(status => status.concurrency === 2 && status.dispatched === 4 && status.completed === 0));
   assert.ok(result.errors.includes('Timed out after 4.2 seconds: 0/100 prayer requests completed.'));
+});
+
+test('recent throughput reflects a slowdown instead of reporting the lifetime average', async () => {
+  const { result, progress } = await fixture({
+    prayers: 40, concurrency: 2, maxConcurrency: 2, responseDelay: number => number <= 10 ? 20 : 400,
+  });
+  const last = progress.at(-1);
+  assert.equal(result.prayerRequestsCompleted, 40);
+  assert.deepEqual(result.errors, []);
+  assert.ok(last.requestsPerSecond < last.averageRequestsPerSecond,
+    `Recent ${last.requestsPerSecond} must show the slowdown relative to average ${last.averageRequestsPerSecond}`);
+  assert.ok(last.latencyMs > 0);
+  assert.equal(typeof last.scalingReason, 'string');
+  assert.ok(progress.every(status => Number.isFinite(status.requestsPerSecond) && Number.isFinite(status.averageRequestsPerSecond)));
 });

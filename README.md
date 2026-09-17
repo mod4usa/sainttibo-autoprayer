@@ -29,14 +29,18 @@ Concurrency automatically adjusts to observed response times:
 - Every two seconds, a healthy window with enough completed requests increases
   the target by one. Rising latency or stalled requests halve the target, down
   to a minimum of one. Existing requests drain naturally when the target drops;
-  they are not cancelled or replaced.
+  they are not cancelled or replaced. After a reduction, the controller skips
+  the next two scaling checks before changing the target again.
 
 ```sh
 node autoprayer.mjs --prayers 100000 --concurrency 8 --max-concurrency 32
 ```
 
-The controller compares mean latency with the best observed window. A window
-is healthy at no more than 1.25 times that baseline (with a 100 ms allowance).
+The controller compares mean latency with a moving baseline, weighted 80% to
+the previous baseline and 20% to the latest window. It learns faster and slower
+conditions, including during cooldown and at concurrency one, so an unusually
+fast early response cannot permanently prevent recovery. A window is healthy
+at no more than 1.25 times the baseline (with a threshold of at least 100 ms).
 It reduces concurrency above twice the baseline (at least 250 ms), or when a
 pending request exceeds three times the baseline (at least one second). Before
 there are any samples, the pending-request threshold is three seconds. These
@@ -45,8 +49,11 @@ performance; the website may be the limiting factor.
 
 Progress is printed to stderr every five seconds and whenever concurrency
 changes, showing dispatched, completed, pending, and failed request counts,
-the concurrency target and maximum, and average completed requests per second.
-The final JSON is printed to stdout.
+the concurrency target and maximum, recent and lifetime-average completed
+requests per second, the latest window's mean latency, and the scaling decision.
+Recent throughput measures completions since the previous rate sample, at least
+one second apart; closely spaced log lines share the latest sample. The final
+JSON is printed to stdout.
 
 `--timeout-seconds` defaults to `0`, which waits indefinitely for prayer requests
 to finish. Set a positive value to limit that wait (fractional seconds are

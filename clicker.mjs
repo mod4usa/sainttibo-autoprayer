@@ -7,16 +7,26 @@ const SITE = 'https://codexreset.org/';
 const BUTTON = '[data-testid="saint-tibo-button"]';
 const COUNTER = '[data-testid="tibo-total-pleas"]';
 
-export function parseClicks(args) {
+export function parseOptions(args) {
   const { values } = parseArgs({
     args,
-    options: { clicks: { type: 'string' }, help: { type: 'boolean', short: 'h' } },
+    options: {
+      clicks: { type: 'string' },
+      'timeout-seconds': { type: 'string', default: '0' },
+      help: { type: 'boolean', short: 'h' },
+    },
   });
   if (values.help) return null;
   if (!/^\d+$/.test(values.clicks ?? '') || !Number.isSafeInteger(Number(values.clicks))) {
     throw new Error('--clicks must be a non-negative safe integer.');
   }
-  return Number(values.clicks);
+  const timeoutSeconds = Number(values['timeout-seconds']);
+  // Node timers overflow above 2^31 - 1 milliseconds and fire immediately.
+  if (!/^\d+(\.\d+)?$/.test(values['timeout-seconds']) ||
+      !Number.isFinite(timeoutSeconds) || timeoutSeconds * 1000 > 2 ** 31 - 1) {
+    throw new Error('--timeout-seconds must be between 0 and 2147483.647 (0 waits indefinitely).');
+  }
+  return { clicks: Number(values.clicks), timeoutSeconds };
 }
 
 export async function launchBrowser() {
@@ -26,7 +36,7 @@ export async function launchBrowser() {
   });
 }
 
-export async function runClicks(page, clicks) {
+export async function runClicks(page, clicks, timeoutSeconds = 0) {
   await page.waitForFunction(selector => {
     const button = document.querySelector(selector);
     return button && !button.disabled;
@@ -85,10 +95,12 @@ export async function runClicks(page, clicks) {
     }, { buttonSelector: BUTTON, counterSelector: COUNTER, clicks });
 
     if (clicks > 0) {
-      timeout = setTimeout(() => {
-        errors.push(`Timed out after 120 seconds: ${completed}/${clicks} click requests completed.`);
-        finish();
-      }, 120_000);
+      if (timeoutSeconds > 0) {
+        timeout = setTimeout(() => {
+          errors.push(`Timed out after ${timeoutSeconds} seconds: ${completed}/${clicks} click requests completed.`);
+          finish();
+        }, timeoutSeconds * 1000);
+      }
       await done;
       clearTimeout(timeout);
     }
@@ -127,16 +139,17 @@ export async function runClicks(page, clicks) {
 }
 
 async function main() {
-  const clicks = parseClicks(process.argv.slice(2));
-  if (clicks === null) {
-    console.log('Usage: node clicker.mjs --clicks <non-negative integer>');
+  const options = parseOptions(process.argv.slice(2));
+  if (options === null) {
+    console.log('Usage: node clicker.mjs --clicks <non-negative integer> [--timeout-seconds <seconds>]');
+    console.log('--timeout-seconds defaults to 0: wait indefinitely for click requests.');
     return;
   }
   const browser = await launchBrowser();
   try {
     const page = await browser.newPage({ reducedMotion: 'reduce' });
     await page.goto(SITE, { waitUntil: 'domcontentloaded' });
-    const result = await runClicks(page, clicks);
+    const result = await runClicks(page, options.clicks, options.timeoutSeconds);
     console.log(JSON.stringify(result, null, 2));
     if (result.errors.length) process.exitCode = 1;
   } finally {

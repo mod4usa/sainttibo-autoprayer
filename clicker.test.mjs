@@ -1,22 +1,33 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
-import { launchBrowser, parseClicks, runClicks } from './clicker.mjs';
+import { launchBrowser, parseOptions, runClicks } from './clicker.mjs';
 
 test('requires an explicit non-negative integer click count', () => {
   for (const args of [[], ['--clicks', '1.5'], ['--clicks=-1'], ['--clicks', 'NaN'],
     ['--clicks', '9007199254740992'], ['--clicks', '2', '--unknown']]) {
-    assert.throws(() => parseClicks(args));
+    assert.throws(() => parseOptions(args));
   }
-  assert.equal(parseClicks(['--clicks', '0']), 0);
-  assert.equal(parseClicks(['--clicks=200']), 200);
-  assert.equal(parseClicks(['--help']), null);
+  assert.deepEqual(parseOptions(['--clicks', '0']), { clicks: 0, timeoutSeconds: 0 });
+  assert.deepEqual(parseOptions(['--clicks=200']), { clicks: 200, timeoutSeconds: 0 });
+  assert.equal(parseOptions(['--help']), null);
+});
+
+test('accepts an optional timeout and rejects invalid or overflowing values', () => {
+  for (const timeoutSeconds of [0, 0.5, 300]) {
+    assert.deepEqual(parseOptions(['--clicks', '2', `--timeout-seconds=${timeoutSeconds}`]),
+      { clicks: 2, timeoutSeconds });
+  }
+  for (const value of ['-1', '', 'NaN', 'Infinity', 'abc', '2147483.648']) {
+    assert.throws(() => parseOptions(['--clicks', '2', `--timeout-seconds=${value}`]),
+      /--timeout-seconds/);
+  }
 });
 
 let browser;
 before(async () => { browser = await launchBrowser(); });
 after(async () => { await browser?.close(); });
 
-async function fixture({ clicks, failure = false, otherClicks = 0 }) {
+async function fixture({ clicks, failure = false, otherClicks = 0, timeoutSeconds, hang = false }) {
   const page = await browser.newPage();
   let counter = 1234;
   let received = 0;
@@ -25,6 +36,7 @@ async function fixture({ clicks, failure = false, otherClicks = 0 }) {
   await page.route('http://clicker.test/**', async route => {
     if (route.request().method() === 'POST') {
       received++;
+      if (hang) return;
       // Responses complete later than click dispatch, as on the live site.
       await new Promise(resolve => setTimeout(resolve, 50));
       if (!failure) counter++;
@@ -46,7 +58,7 @@ async function fixture({ clicks, failure = false, otherClicks = 0 }) {
   });
   try {
     await page.goto('http://clicker.test/');
-    const result = await runClicks(page, clicks);
+    const result = await runClicks(page, clicks, timeoutSeconds);
     return { result, received, completedAtReload };
   } finally {
     await page.close();
@@ -81,4 +93,17 @@ test('reports rejected requests even when other visitors increase the counter', 
   assert.equal(result.counterIncrease, 10);
   assert.equal(result.errors.length, 3);
   assert.match(result.errors[0], /HTTP 503/);
+});
+
+test('an explicit zero timeout waits for delayed click requests', async () => {
+  const { result, completedAtReload } = await fixture({ clicks: 3, timeoutSeconds: 0 });
+  assert.equal(completedAtReload, 3);
+  assert.equal(result.clickRequestsCompleted, 3);
+  assert.deepEqual(result.errors, []);
+});
+
+test('a configured timeout reports incomplete click requests', async () => {
+  const { result } = await fixture({ clicks: 1, timeoutSeconds: 0.05, hang: true });
+  assert.ok(result.errors.includes('Timed out after 0.05 seconds: 0/1 click requests completed.'));
+  assert.equal(result.afterCounter, result.beforeCounter);
 });

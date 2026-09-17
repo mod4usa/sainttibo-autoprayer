@@ -18,6 +18,17 @@ button to become enabled, and calls the picture's normal DOM `click()` handler
 the requested number of times in a browser-side loop with no intentional delay.
 These are simulated DOM clicks, not physical mouse input.
 
+`--timeout-seconds` defaults to `0`, which waits indefinitely for click requests
+to finish. Set a positive value to limit that wait (fractional seconds are
+accepted, up to 2147483.647 seconds):
+
+```sh
+node clicker.mjs --clicks 100 --timeout-seconds 300
+```
+
+This option controls click-request completion only; browser navigation and
+element waits retain Playwright's existing timeouts. Press Ctrl+C to stop a run.
+
 Output is JSON containing:
 
 - `beforeCounter` and `startTime`: the displayed public counter and UTC time just
@@ -34,7 +45,7 @@ Elapsed durations use the browser's monotonic performance clock. Other visitors
 can increase the public counter during the run, so `counterIncrease` need not
 equal `clicksRequested`. The script waits for its own requests rather than
 inferring completion from the public counter. An HTTP/network failure or a
-120-second request completion timeout is reported in `errors` and produces a
+configured request completion timeout is reported in `errors` and produces a
 nonzero exit status. Failed requests are not retried because a retry could
 duplicate a click that reached the server. HTTP success is not an independent
 guarantee that the server persisted each click.
